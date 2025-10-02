@@ -1,1049 +1,1064 @@
 --!strict
 -- GameManager.lua
--- Core server-side game loop management for the boss-vs-survivor experience.
 -- Place this ModuleScript in ServerScriptService and require it from a Script to boot the loop.
+-- Rewritten round system that manages intermissions, character selection, and boss versus fighter rounds.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
 
 local BossRoster = require(ReplicatedStorage:WaitForChild("BossRoster"))
 local FighterRoster = require(ReplicatedStorage:WaitForChild("FighterRoster"))
 
+type Player = Players.Player
+
+export type StepName = "Waiting" | "Intermission" | "CharacterSelect" | "SelectionLock" | "Round" | "RoundResults"
+
 local GameManager = {}
 GameManager.__index = GameManager
 
--- Configuration tables -----------------------------------------------------
-
-GameManager.IntermissionLength = 45 -- seconds
-GameManager.BaseRoundLength = 150 -- 2 minutes 30 seconds
-GameManager.RoundIncrementPerFighter = 45
 GameManager.MinimumPlayersToStart = 3
-GameManager.MaxBosses = 2
+GameManager.IntermissionLength = 45
 GameManager.CharacterSelectLength = 30
-GameManager.SelectionLockLength = 2
+GameManager.SelectionLockLength = 3
+GameManager.ResultsLength = 8
+GameManager.BaseRoundLength = 150 -- 2:30 minutes
+GameManager.RoundIncrementPerFighter = 45
+GameManager.MaxBosses = 2
 
-GameManager.SurvivorCharacters = FighterRoster
-GameManager.BossCharacters = BossRoster
+GameManager.RoundLengthOverride = 0 -- Optional override for a fixed round length.
 
-local roundWinners = {
-    BossVictory = "Boss",
-    FighterVictory = "Fighter",
-    BossLeft = "Fighter",
-    AllFightersLeft = "Boss",
-    NoBosses = "Fighter",
-    NoFighters = "Boss",
-}
+local ROLE_FIGHTER = "Fighter"
+local ROLE_BOSS = "Boss"
 
-local function findCharacterInfo(roster: {{name: string}}, characterName: string)
-    for _, info in ipairs(roster) do
-        if info.name == characterName then
-            return info
-        end
-    end
-    return nil
+local TEST_MODEL_PATH = {"Folder", "test models"}
+
+local function findTestModelFolder(): Instance?
+	local current: Instance? = Workspace
+	for _, segment in ipairs(TEST_MODEL_PATH) do
+		if not current then
+			return nil
+		end
+		current = current:FindFirstChild(segment)
+	end
+	return current
 end
 
-local function rosterContains(roster: {{name: string}}, characterName: string): boolean
-    return findCharacterInfo(roster, characterName) ~= nil
+local function markRoundSkin(instance: Instance)
+	if instance:IsA("BasePart") then
+		instance.Anchored = false
+		instance.CanCollide = false
+		instance.Massless = true
+		instance:SetAttribute("RoundSkinPart", true)
+	elseif instance:IsA("Decal") or instance:IsA("ParticleEmitter") or instance:IsA("Trail") then
+		instance:SetAttribute("RoundSkinPart", true)
+		if instance:IsA("ParticleEmitter") or instance:IsA("Trail") then
+			instance.Enabled = true
+		end
+	end
+	for _, child in ipairs(instance:GetChildren()) do
+		markRoundSkin(child)
+	end
 end
 
-local function countDictionaryKeys(dictionary: {[any]: any}): number
-    local count = 0
-    for _ in pairs(dictionary) do
-        count += 1
-    end
-    return count
+local function getTimeNow(): number
+	if workspace and workspace.GetServerTimeNow then
+		return workspace:GetServerTimeNow()
+	end
+	return os.clock()
 end
 
--- Utility functions --------------------------------------------------------
-
-local function shuffle(array: {any})
-    local n = #array
-    for i = n, 2, -1 do
-        local j = math.random(i)
-        array[i], array[j] = array[j], array[i]
-    end
-    return array
+local function findRosterEntry(roster: {{name: string}}, name: string)
+	for _, info in ipairs(roster) do
+		if info.name == name then
+			return info
+		end
+	end
+	return nil
 end
 
-local function findHighestChancePlayers(bossChances: {[Player]: number}, amount: number): {Player}
-    local sortable = {}
-    for player, value in pairs(bossChances) do
-        table.insert(sortable, {player = player, chance = value})
-    end
-    table.sort(sortable, function(a, b)
-        if a.chance == b.chance then
-            return a.player.Name < b.player.Name
-        end
-        return a.chance > b.chance
-    end)
+local function rosterContains(roster: {{name: string}}, name: string): boolean
+	return findRosterEntry(roster, name) ~= nil
+end
 
-    local selected = {}
-    for index = 1, amount do
-        local entry = sortable[index]
-        if entry and entry.player then
-            table.insert(selected, entry.player)
-        end
-    end
-    return selected
+local function getRosterForRole(role: string)
+	if role == ROLE_BOSS then
+		return BossRoster
+	end
+	return FighterRoster
+end
+
+local function deepCopy(value: any): any
+	if typeof(value) ~= "table" then
+		return value
+	end
+
+	local copy = {}
+	for key, subValue in pairs(value) do
+		copy[key] = deepCopy(subValue)
+	end
+	return copy
 end
 
 local function createRemoteEvent(name: string)
-    local existing = ReplicatedStorage:FindFirstChild(name)
-    if existing and existing:IsA("RemoteEvent") then
-        return existing
-    end
+	local existing = ReplicatedStorage:FindFirstChild(name)
+	if existing and existing:IsA("RemoteEvent") then
+		return existing
+	end
 
-    local event = Instance.new("RemoteEvent")
-    event.Name = name
-    event.Parent = ReplicatedStorage
-    return event
+	local remote = Instance.new("RemoteEvent")
+	remote.Name = name
+	remote.Parent = ReplicatedStorage
+	return remote
 end
 
--- Lifecycle ----------------------------------------------------------------
+local function createRemoteFunction(name: string)
+	local existing = ReplicatedStorage:FindFirstChild(name)
+	if existing and existing:IsA("RemoteFunction") then
+		return existing
+	end
+
+	local remote = Instance.new("RemoteFunction")
+	remote.Name = name
+	remote.Parent = ReplicatedStorage
+	return remote
+end
 
 function GameManager.new()
-    local self = setmetatable({}, GameManager)
+	local self = setmetatable({}, GameManager)
 
-    self.State = "Waiting"
-    self.BossChances = {}
-    self.RoundPlayers = {
-        Bosses = {},
-        Fighters = {},
-        RoleLookup = {},
-    }
-    self.ReservedCharacters = {
-        Survivors = {},
-        Bosses = {},
-    }
+	self.State = "Waiting"
+	self.StateStartedAt = getTimeNow()
+	self.StateEndsAt = 0
 
-    self.RoundConnections = {
-        Players = {},
-    }
+	self.Remotes = {
+		RoundStateChanged = createRemoteEvent("RoundStateChanged"),
+		CharacterAssignment = createRemoteEvent("CharacterAssignment"),
+		RequestCharacter = createRemoteEvent("RequestCharacter"),
+		GetRoundState = createRemoteFunction("GetRoundState"),
+	}
 
-    self.Remotes = {
-        RoundStateChanged = createRemoteEvent("RoundStateChanged"),
-        RequestCharacter = createRemoteEvent("RequestCharacter"),
-        CharacterAssignment = createRemoteEvent("CharacterAssignment"),
-    }
+	self.BossChances = {}
+	self.Assignments = {} -- [Player] = {role, character}
+	self.ReservedCharacters = {
+		Bosses = {},
+		Survivors = {},
+	}
 
-    self.ActiveRoundLength = 0
-    self.IntermissionTimeLeft = 0
-    self.RoundCountdown = 0
-    self.CharacterSelectTimeLeft = 0
-    self.SelectionLockTimeLeft = 0
+	self.RoundParticipants = {
+		Bosses = {},
+		Fighters = {},
+	}
 
-    self._lastPrintedTimes = {}
-    self._lastBroadcastTimes = {}
-    self._announcedWaiting = false
+	self.RoundAlive = {
+		Bosses = {},
+		Fighters = {},
+	}
 
-    self:_setupPlayerListeners()
+	self.RoundConnections = {
+		Players = {},
+		Heartbeat = nil,
+	}
 
-    return self
+	self.RoundEndsAt = 0
+	self.RoundLength = 0
+	self.RoundWinner = nil
+	self.RoundEndReason = nil
+	self.RoundLeavers = 0
+
+	self._lastPayload = nil
+
+	self.Remotes.GetRoundState.OnServerInvoke = function()
+		return self:_buildStatePayload()
+	end
+
+	self.Remotes.RequestCharacter.OnServerEvent:Connect(function(player, role: string, characterName: string)
+		self:_onCharacterRequested(player, role, characterName)
+	end)
+
+	Players.PlayerAdded:Connect(function(player)
+		self:_onPlayerAdded(player)
+	end)
+
+	Players.PlayerRemoving:Connect(function(player)
+		self:_onPlayerRemoving(player)
+	end)
+
+	for _, player in ipairs(Players:GetPlayers()) do
+		self:_onPlayerAdded(player)
+	end
+
+	self.RoundConnections.Heartbeat = RunService.Heartbeat:Connect(function()
+		self:_onHeartbeat()
+	end)
+
+	print("[GameManager] Initialized round system.")
+
+	return self
 end
 
-function GameManager:_rebuildRoleLookup()
-    self.RoundPlayers.RoleLookup = {}
+function GameManager:Destroy()
+	if self.RoundConnections.Heartbeat then
+		self.RoundConnections.Heartbeat:Disconnect()
+		self.RoundConnections.Heartbeat = nil
+	end
 
-    for _, boss in ipairs(self.RoundPlayers.Bosses) do
-        self.RoundPlayers.RoleLookup[boss] = "Boss"
-    end
+	for _, conn in pairs(self.RoundConnections.Players) do
+		conn:Disconnect()
+	end
 
-    for _, fighter in ipairs(self.RoundPlayers.Fighters) do
-        self.RoundPlayers.RoleLookup[fighter] = "Fighter"
-    end
+	self.RoundConnections.Players = {}
 end
 
-function GameManager:_setupPlayerListeners()
-    Players.PlayerAdded:Connect(function(player)
-        self.BossChances[player] = self.BossChances[player] or 0
-        player:SetAttribute("BossChance", self.BossChances[player])
-        player:SetAttribute("AssignedRole", "")
-        player:SetAttribute("AssignedCharacter", "")
+function GameManager:_onPlayerAdded(player: Player)
+	self.BossChances[player] = self.BossChances[player] or 0
+	self.Assignments[player] = nil
+	print(string.format("[GameManager] Player joined: %s", player.Name))
 
-        player.CharacterRemoving:Connect(function()
-            -- Clear assigned character when the character despawns to avoid confusion.
-            player:SetAttribute("AssignedCharacter", "")
-        end)
-    end)
+	local payload = self:_buildStatePayload()
+	self.Remotes.RoundStateChanged:FireClient(player, payload)
 
-    Players.PlayerRemoving:Connect(function(player)
-        self:OnPlayerLeft(player)
-    end)
-
-    self.Remotes.RequestCharacter.OnServerEvent:Connect(function(player, role, characterName)
-        self:AssignCharacter(player, role, characterName)
-    end)
+	if self.State == "Waiting" and self:_enoughPlayers() then
+		self:_beginIntermission()
+	end
 end
 
--- Intermission -------------------------------------------------------------
+function GameManager:_onPlayerRemoving(player: Player)
+	print(string.format("[GameManager] Player leaving: %s", player.Name))
 
-function GameManager:Start()
-    -- Call this once from a Script to start the game loop.
-    task.spawn(function()
-        while true do
-            local deltaTime = RunService.Heartbeat:Wait()
-            if self.State == "Waiting" then
-                self:TryStartIntermission()
-            elseif self.State == "Intermission" then
-                self:UpdateIntermission(deltaTime)
-            elseif self.State == "CharacterSelect" then
-                self:UpdateCharacterSelection(deltaTime)
-            elseif self.State == "SelectionLock" then
-                self:UpdateSelectionLock(deltaTime)
-            elseif self.State == "Round" then
-                self:UpdateRound(deltaTime)
-            end
-        end
-    end)
+	self.BossChances[player] = nil
+	self.Assignments[player] = nil
+
+	for role, reservations in pairs(self.ReservedCharacters) do
+		for characterName, reservedPlayer in pairs(reservations) do
+			if reservedPlayer == player then
+				reservations[characterName] = nil
+			end
+		end
+	end
+
+	if self.State == "CharacterSelect" or self.State == "SelectionLock" then
+		self:_checkSelectionProgress()
+	elseif self.State == "Round" then
+		if self.RoundAlive.Bosses[player] or self.RoundAlive.Fighters[player] then
+			self.RoundLeavers += 1
+			self:_markParticipantDown(player)
+			if self.RoundLeavers > 2 then
+				self:_endRound("TooManyPlayersLeft")
+			end
+		end
+	end
+
+	if not self:_enoughPlayers() then
+		if self.State == "Round" then
+			self:_endRound("NotEnoughPlayers")
+		elseif self.State ~= "Waiting" then
+			self:_switchState("Waiting")
+		end
+	end
 end
 
-function GameManager:_log(message: string)
-    print(string.format("[GameManager] %s", message))
+function GameManager:_enoughPlayers(): boolean
+	return #Players:GetPlayers() >= GameManager.MinimumPlayersToStart
 end
 
-function GameManager:_broadcastState(state: string, payload: {[string]: any}?)
-    self.Remotes.RoundStateChanged:FireAllClients(state, payload)
+function GameManager:_onHeartbeat()
+	local now = getTimeNow()
+
+	if self.State == "Waiting" then
+		if self:_enoughPlayers() then
+			self:_beginIntermission()
+		end
+		return
+	end
+
+	if not self:_enoughPlayers() then
+		if self.State ~= "Waiting" then
+			self:_switchState("Waiting")
+		end
+		return
+	end
+
+	if self.State == "Intermission" then
+		if now >= self.StateEndsAt then
+			self:_beginCharacterSelect()
+		end
+	elseif self.State == "CharacterSelect" then
+		if now >= self.StateEndsAt then
+			self:_lockSelections()
+		end
+	elseif self.State == "SelectionLock" then
+		if now >= self.StateEndsAt then
+			self:_beginRound()
+		end
+	elseif self.State == "Round" then
+		self:_updateRoundHealth()
+		if now >= self.RoundEndsAt then
+			self:_handleRoundTimeout()
+		end
+	elseif self.State == "RoundResults" then
+		if now >= self.StateEndsAt then
+			self:_beginIntermission()
+		end
+	end
 end
 
-function GameManager:_broadcastTimedState(state: string, timeValue: number, extraPayload: {[string]: any}?, force: boolean?)
-    local rounded = math.max(0, math.ceil(timeValue))
-    local key = state .. "_broadcast"
-    if not force and self._lastBroadcastTimes[key] == rounded then
-        return
-    end
-    self._lastBroadcastTimes[key] = rounded
+function GameManager:_switchState(newState: StepName, endsAt: number?)
+	self.State = newState
+	self.StateStartedAt = getTimeNow()
+	if endsAt then
+		self.StateEndsAt = endsAt
+	else
+		self.StateEndsAt = 0
+	end
 
-    local payload = extraPayload or {}
-    payload.timeLeft = rounded
-    self:_broadcastState(state, payload)
+	if newState == "Waiting" then
+		self.Assignments = {}
+		self.ReservedCharacters = {Bosses = {}, Survivors = {}}
+		self.RoundParticipants = {Bosses = {}, Fighters = {}}
+		self.RoundAlive = {Bosses = {}, Fighters = {}}
+		self.RoundWinner = nil
+		self.RoundEndReason = nil
+		self.RoundLength = 0
+		self.RoundEndsAt = 0
+		self.RoundLeavers = 0
+	end
+
+	print(string.format("[GameManager] Entering step: %s", newState))
+	if newState == "Round" then
+		self:_applyRoundAppearances()
+	else
+		self:_restoreAllAppearances()
+	end
+	self:_broadcastState()
 end
 
-function GameManager:_collectAliveFighterNames(): {string}
-    local names = {}
+function GameManager:_beginIntermission()
+	self.Assignments = {}
+	self.ReservedCharacters = {Bosses = {}, Survivors = {}}
+	self.RoundParticipants = {Bosses = {}, Fighters = {}}
+	self.RoundAlive = {Bosses = {}, Fighters = {}}
+	self.RoundLeavers = 0
+	self.RoundWinner = nil
+	self.RoundEndReason = nil
+	self.RoundLength = 0
+	self.RoundEndsAt = 0
 
-    if not self.RoundPlayers then
-        return names
-    end
+	for _, player in ipairs(Players:GetPlayers()) do
+		self.BossChances[player] = (self.BossChances[player] or 0) + 1
+	end
 
-    local fighters = self.RoundPlayers.Fighters or {}
-    local aliveBucket = self.RoundPlayers.Alive and self.RoundPlayers.Alive.Fighters or nil
-    local added = {}
-
-    if fighters then
-        for _, fighter in ipairs(fighters) do
-            if fighter then
-                local aliveStatus = aliveBucket and aliveBucket[fighter]
-                if aliveStatus ~= false then
-                    table.insert(names, fighter.Name)
-                    added[fighter] = true
-                end
-            end
-        end
-    end
-
-    if aliveBucket then
-        for player, alive in pairs(aliveBucket) do
-            if alive and player and not added[player] then
-                table.insert(names, player.Name)
-            end
-        end
-    end
-
-    return names
+	local endsAt = getTimeNow() + GameManager.IntermissionLength
+	self:_switchState("Intermission", endsAt)
 end
 
-function GameManager:_collectBossStatus(): {{[string]: any}}
-    local statuses = {}
-
-    if not self.RoundPlayers or not self.RoundPlayers.Bosses then
-        return statuses
-    end
-
-    for _, bossPlayer in ipairs(self.RoundPlayers.Bosses) do
-        if bossPlayer then
-            local assignedCharacter = bossPlayer:GetAttribute("AssignedCharacter")
-            assignedCharacter = typeof(assignedCharacter) == "string" and assignedCharacter or ""
-
-            local info = assignedCharacter ~= "" and findCharacterInfo(GameManager.BossCharacters, assignedCharacter) or nil
-            local profileId = ""
-            local expectedHp = 0
-
-            if info then
-                if info.images and info.images.profile then
-                    profileId = tostring(info.images.profile)
-                end
-                if info.stats and info.stats.hp then
-                    expectedHp = info.stats.hp
-                end
-            end
-
-            local humanoid = bossPlayer.Character and bossPlayer.Character:FindFirstChildOfClass("Humanoid")
-            local health = expectedHp
-            local maxHealth = expectedHp
-
-            if humanoid then
-                health = math.max(0, math.floor(humanoid.Health + 0.5))
-                maxHealth = math.max(0, math.floor(humanoid.MaxHealth + 0.5))
-            end
-
-            table.insert(statuses, {
-                playerName = bossPlayer.Name,
-                characterName = assignedCharacter,
-                health = health,
-                maxHealth = maxHealth,
-                profileId = profileId,
-            })
-        end
-    end
-
-    table.sort(statuses, function(left, right)
-        if left.playerName == right.playerName then
-            return left.characterName < right.characterName
-        end
-        return left.playerName < right.playerName
-    end)
-
-    return statuses
+function GameManager:_determineBossCount(): number
+	local playerCount = #Players:GetPlayers()
+	if playerCount > 7 then
+		return math.max(1, math.min(GameManager.MaxBosses, 2))
+	end
+	return 1
 end
 
-function GameManager:_buildRoundPayload(): {[string]: any}
-    local fighters = (self.RoundPlayers and self.RoundPlayers.Fighters) or {}
-    local bosses = (self.RoundPlayers and self.RoundPlayers.Bosses) or {}
+function GameManager:_pickBossPlayers(): {Player}
+	local bossCount = self:_determineBossCount()
+	local sortable = {}
+	for player, chance in pairs(self.BossChances) do
+		table.insert(sortable, {player = player, chance = chance})
+	end
 
-    return {
-        roundLength = self.ActiveRoundLength,
-        fighters = #fighters,
-        bosses = #bosses,
-        fighterNames = self:_collectAliveFighterNames(),
-        bossStatus = self:_collectBossStatus(),
-    }
+	table.sort(sortable, function(a, b)
+		if a.chance == b.chance then
+			return a.player.Name < b.player.Name
+		end
+		return a.chance > b.chance
+	end)
+
+	local bosses = {}
+	for i = 1, bossCount do
+		local entry = sortable[i]
+		if entry and entry.player then
+			table.insert(bosses, entry.player)
+		end
+	end
+
+	if #bosses == 0 and sortable[1] then
+		table.insert(bosses, sortable[1].player)
+	end
+
+	return bosses
 end
 
-function GameManager:_broadcastBossVitals(force: boolean?)
-    if self.State ~= "Round" then
-        return
-    end
+function GameManager:_beginCharacterSelect()
+	local players = Players:GetPlayers()
+	if #players < GameManager.MinimumPlayersToStart then
+		self:_switchState("Waiting")
+		return
+	end
 
-    self:_broadcastTimedState("Round", self.RoundCountdown, self:_buildRoundPayload(), force)
+	local bosses = self:_pickBossPlayers()
+	local bossLookup: {[Player]: boolean} = {}
+	for _, player in ipairs(bosses) do
+		bossLookup[player] = true
+		self.BossChances[player] = 0
+	end
+
+	self.Assignments = {}
+	for _, player in ipairs(players) do
+		local role = bossLookup[player] and ROLE_BOSS or ROLE_FIGHTER
+		self.Assignments[player] = {role = role, character = nil}
+	end
+
+	self.ReservedCharacters = {Bosses = {}, Survivors = {}}
+	local endsAt = getTimeNow() + GameManager.CharacterSelectLength
+	self:_switchState("CharacterSelect", endsAt)
+	self:_broadcastAssignments()
 end
 
-function GameManager:_reportTime(state: string, secondsRemaining: number)
-    local rounded = math.max(0, math.ceil(secondsRemaining))
-    local key = state .. "_time"
-    if self._lastPrintedTimes[key] ~= rounded then
-        self._lastPrintedTimes[key] = rounded
-        self:_log(string.format("%s - %d seconds remaining", state, rounded))
-    end
-end
+function GameManager:_lockSelections()
+	if self.State ~= "CharacterSelect" then
+		return
+	end
 
-function GameManager:TryStartIntermission()
-    local playerCount = #Players:GetPlayers()
-    if playerCount < GameManager.MinimumPlayersToStart then
-        if not self._announcedWaiting then
-            self:_log("Waiting for enough players to start intermission")
-            self._announcedWaiting = true
-        end
-        return
-    end
-
-    self._announcedWaiting = false
-    self.State = "Intermission"
-    self.IntermissionTimeLeft = GameManager.IntermissionLength
-    self.ReservedCharacters = {
-        Survivors = {},
-        Bosses = {},
-    }
-    self.RoundPlayers = {
-        Bosses = {},
-        Fighters = {},
-        RoleLookup = {},
-        LeftCount = 0,
-    }
-    self:_log(string.format("Starting intermission with %d players", playerCount))
-    self._lastBroadcastTimes["Intermission_broadcast"] = nil
-    self._lastPrintedTimes["Intermission_time"] = nil
-    self:_broadcastTimedState("Intermission", self.IntermissionTimeLeft)
-end
-
-function GameManager:UpdateIntermission(deltaTime: number)
-    if self.IntermissionTimeLeft <= 0 then
-        self:SelectBosses()
-        self.State = "CharacterSelect"
-        self.RoundCountdown = 0
-        self.CharacterSelectTimeLeft = GameManager.CharacterSelectLength
-        self:_log("Entering character selection")
-        self._lastBroadcastTimes["CharacterSelect_broadcast"] = nil
-        self._lastPrintedTimes["CharacterSelect_time"] = nil
-        self:_broadcastCharacterSelectState(true)
-        return
-    end
-
-    self.IntermissionTimeLeft -= deltaTime
-    self:_reportTime("Intermission", self.IntermissionTimeLeft)
-    self:_broadcastTimedState("Intermission", self.IntermissionTimeLeft)
-end
-
--- Boss selection -----------------------------------------------------------
-
-function GameManager:SelectBosses()
-    local players = Players:GetPlayers()
-    if #players == 0 then
-        return
-    end
-
-    for _, player in ipairs(players) do
-        self.BossChances[player] = (self.BossChances[player] or 0) + 1
-        player:SetAttribute("BossChance", self.BossChances[player])
-    end
-
-    local bossCount = math.clamp(#players > 7 and 2 or 1, 1, GameManager.MaxBosses)
-    local selectedBosses = findHighestChancePlayers(self.BossChances, bossCount)
-
-    -- Reset chances for selected boss(es)
-    for _, boss in ipairs(selectedBosses) do
-        self.BossChances[boss] = 0
-        boss:SetAttribute("BossChance", 0)
-    end
-
-    self.RoundPlayers.Bosses = selectedBosses
-    self.RoundPlayers.Fighters = {}
-
-    for _, player in ipairs(players) do
-        if not table.find(selectedBosses, player) then
-            table.insert(self.RoundPlayers.Fighters, player)
-        end
-    end
-
-    self:_rebuildRoleLookup()
-    self.RoundPlayers.LeftCount = 0
-
-    local bossNames = {}
-    for _, boss in ipairs(selectedBosses) do
-        table.insert(bossNames, boss.Name)
-    end
-    local bossRosterText = #bossNames > 0 and table.concat(bossNames, ", ") or "None"
-    self:_log(string.format("Selected boss roster: %s", bossRosterText))
-    self:_log(string.format("Fighters queued: %d", #self.RoundPlayers.Fighters))
-
-    for _, player in ipairs(players) do
-        local role = table.find(selectedBosses, player) and "Boss" or "Fighter"
-        player:SetAttribute("AssignedRole", role)
-        player:SetAttribute("AssignedCharacter", "")
-    end
-end
-
--- Character selection ------------------------------------------------------
-
-function GameManager:_clearPlayerReservation(player: Player)
-    local roleValue = player:GetAttribute("AssignedRole")
-    local assignedCharacter = player:GetAttribute("AssignedCharacter")
-    if typeof(roleValue) ~= "string" or roleValue == "" then
-        return
-    end
-
-    if typeof(assignedCharacter) ~= "string" or assignedCharacter == "" then
-        return
-    end
-
-    local roleKey = roleValue == "Boss" and "Bosses" or "Survivors"
-    local pool = self.ReservedCharacters[roleKey]
-    if pool[assignedCharacter] == player then
-        pool[assignedCharacter] = nil
-        player:SetAttribute("AssignedCharacter", "")
-        local remoteRole = roleValue == "Boss" and "Boss" or "Fighter"
-        self.Remotes.CharacterAssignment:FireAllClients(nil, remoteRole, assignedCharacter)
-    end
-end
-
-function GameManager:_removeFromRound(player: Player)
-    for index, boss in ipairs(self.RoundPlayers.Bosses) do
-        if boss == player then
-            table.remove(self.RoundPlayers.Bosses, index)
-            break
-        end
-    end
-
-    for index, fighter in ipairs(self.RoundPlayers.Fighters) do
-        if fighter == player then
-            table.remove(self.RoundPlayers.Fighters, index)
-            break
-        end
-    end
-
-    if self.RoundPlayers.RoleLookup then
-        self.RoundPlayers.RoleLookup[player] = nil
-    end
-
-    if self.RoundPlayers.Alive then
-        if self.RoundPlayers.Alive.Bosses then
-            self.RoundPlayers.Alive.Bosses[player] = nil
-        end
-        if self.RoundPlayers.Alive.Fighters then
-            self.RoundPlayers.Alive.Fighters[player] = nil
-        end
-    end
-
-    self:_disconnectPlayerConnections(player)
-    self:_rebuildRoleLookup()
-end
-
-function GameManager:AssignCharacter(player: Player, role: string, characterName: string)
-    if self.State ~= "CharacterSelect" then
-        return
-    end
-
-    local roleKey = role == "Boss" and "Bosses" or "Survivors"
-    local roster = role == "Boss" and self.RoundPlayers.Bosses or self.RoundPlayers.Fighters
-
-    if not roster or not table.find(roster, player) then
-        return
-    end
-
-    local currentCharacter = player:GetAttribute("AssignedCharacter")
-    if typeof(currentCharacter) == "string" and currentCharacter ~= "" then
-        return
-    end
-
-    local pool = role == "Boss" and GameManager.BossCharacters or GameManager.SurvivorCharacters
-    if not rosterContains(pool, characterName) then
-        return
-    end
-
-    if self.ReservedCharacters[roleKey][characterName] then
-        return
-    end
-
-    self.ReservedCharacters[roleKey][characterName] = player
-    player:SetAttribute("AssignedCharacter", characterName)
-    self.Remotes.CharacterAssignment:FireAllClients(player, role, characterName)
-
-    if role == "Boss" then
-        self:_log(string.format("%s locked in boss character %s", player.Name, characterName))
-    else
-        self:_log(string.format("%s locked in survivor character %s", player.Name, characterName))
-    end
-
-    self:_broadcastCharacterSelectState(true)
-
-    self:CheckCharacterSelectionCompletion()
-end
-
-function GameManager:CheckCharacterSelectionCompletion()
-    if self.State ~= "CharacterSelect" then
-        return
-    end
-
-    local allAssigned = true
-
-    for _, boss in ipairs(self.RoundPlayers.Bosses) do
-        if boss:GetAttribute("AssignedCharacter") == "" then
-            allAssigned = false
-            break
-        end
-    end
-
-    if allAssigned then
-        for _, fighter in ipairs(self.RoundPlayers.Fighters) do
-            if fighter:GetAttribute("AssignedCharacter") == "" then
-                allAssigned = false
-                break
-            end
-        end
-    end
-
-    if allAssigned then
-        self:_transitionToSelectionLock()
-    end
+	self:_autoAssignMissingCharacters()
+	local endsAt = getTimeNow() + GameManager.SelectionLockLength
+	self:_switchState("SelectionLock", endsAt)
 end
 
 function GameManager:_autoAssignMissingCharacters()
-    for _, boss in ipairs(self.RoundPlayers.Bosses) do
-        if boss:GetAttribute("AssignedCharacter") == "" then
-            for _, characterInfo in ipairs(GameManager.BossCharacters) do
-                local characterName = characterInfo.name
-                if not self.ReservedCharacters.Bosses[characterName] then
-                    self.ReservedCharacters.Bosses[characterName] = boss
-                    boss:SetAttribute("AssignedCharacter", characterName)
-                    self.Remotes.CharacterAssignment:FireAllClients(boss, "Boss", characterName)
-                    self:_log(string.format("Auto-assigned boss %s to %s", boss.Name, characterName))
-                    break
-                end
-            end
-        end
-    end
+	local availableBosses = {}
+	for _, info in ipairs(BossRoster) do
+		if self.ReservedCharacters.Bosses[info.name] == nil then
+			table.insert(availableBosses, info.name)
+		end
+	end
 
-    for _, fighter in ipairs(self.RoundPlayers.Fighters) do
-        if fighter:GetAttribute("AssignedCharacter") == "" then
-            for _, characterInfo in ipairs(GameManager.SurvivorCharacters) do
-                local characterName = characterInfo.name
-                if not self.ReservedCharacters.Survivors[characterName] then
-                    self.ReservedCharacters.Survivors[characterName] = fighter
-                    fighter:SetAttribute("AssignedCharacter", characterName)
-                    self.Remotes.CharacterAssignment:FireAllClients(fighter, "Fighter", characterName)
-                    self:_log(string.format("Auto-assigned survivor %s to %s", fighter.Name, characterName))
-                    break
-                end
-            end
-        end
-    end
+	local availableFighters = {}
+	for _, info in ipairs(FighterRoster) do
+		if self.ReservedCharacters.Survivors[info.name] == nil then
+			table.insert(availableFighters, info.name)
+		end
+	end
+
+	for player, assignment in pairs(self.Assignments) do
+		if assignment.character == nil then
+			if assignment.role == ROLE_BOSS then
+				local pick = table.remove(availableBosses, 1)
+				if not pick then
+					pick = BossRoster[1] and BossRoster[1].name or "Boss"
+				end
+				assignment.character = pick
+				self.ReservedCharacters.Bosses[pick] = player
+			else
+				local pick = table.remove(availableFighters, 1)
+				if not pick then
+					pick = FighterRoster[1] and FighterRoster[1].name or "Fighter"
+				end
+				assignment.character = pick
+				self.ReservedCharacters.Survivors[pick] = player
+			end
+		end
+	end
+
+	self:_broadcastAssignments()
 end
 
-function GameManager:_disconnectPlayerConnections(player: Player)
-    local bucket = self.RoundConnections.Players[player]
-    if not bucket then
-        return
-    end
+function GameManager:_beginRound()
+	if self.State ~= "SelectionLock" then
+		return
+	end
 
-    for _, connection in pairs(bucket) do
-        if connection and connection.Disconnect then
-            connection:Disconnect()
-        end
-    end
+	local bosses = {}
+	local fighters = {}
 
-    self.RoundConnections.Players[player] = nil
+	for player, assignment in pairs(self.Assignments) do
+		if assignment.role == ROLE_BOSS then
+			table.insert(bosses, player)
+		else
+			table.insert(fighters, player)
+		end
+	end
+
+	if #bosses == 0 or #fighters == 0 then
+		self:_endRound("NoOpponents")
+		return
+	end
+
+	self.RoundParticipants = {Bosses = bosses, Fighters = fighters}
+	self.RoundAlive = {Bosses = {}, Fighters = {}}
+
+	local fighterCount = #fighters
+	if GameManager.RoundLengthOverride > 0 then
+		self.RoundLength = GameManager.RoundLengthOverride
+	else
+		self.RoundLength = GameManager.BaseRoundLength + (fighterCount * GameManager.RoundIncrementPerFighter)
+	end
+
+	self.RoundEndsAt = getTimeNow() + self.RoundLength
+
+	for _, player in ipairs(bosses) do
+		self.RoundAlive.Bosses[player] = true
+		self:_trackParticipant(player)
+	end
+
+	for _, player in ipairs(fighters) do
+		self.RoundAlive.Fighters[player] = true
+		self:_trackParticipant(player)
+	end
+
+	self.RoundWinner = nil
+	self.RoundEndReason = nil
+	self.RoundLeavers = 0
+
+	self:_switchState("Round", self.RoundEndsAt)
 end
 
-function GameManager:_cleanupRoundConnections()
-    for player, connectionSet in pairs(self.RoundConnections.Players) do
-        if connectionSet then
-            for _, connection in pairs(connectionSet) do
-                if connection and connection.Disconnect then
-                    connection:Disconnect()
-                end
-            end
-        end
-        self.RoundConnections.Players[player] = nil
-    end
+function GameManager:_updateRoundHealth()
+	for role, aliveMap in pairs(self.RoundAlive) do
+		for player in pairs(aliveMap) do
+			local character = player.Character
+			if character then
+				local humanoid = character:FindFirstChildOfClass("Humanoid")
+				if humanoid then
+					if humanoid.Health <= 0 then
+						self:_markParticipantDown(player)
+					end
+				end
+			end
+		end
+	end
 end
 
-function GameManager:_handleCharacterSpawn(player: Player, role: string, character: Model)
-    if self.State ~= "Round" then
-        return
-    end
+function GameManager:_markParticipantDown(player: Player)
+	if self.RoundAlive.Bosses[player] then
+		self.RoundAlive.Bosses[player] = nil
+	end
 
-    if self.RoundPlayers.Eliminated and self.RoundPlayers.Eliminated[player] then
-        return
-    end
+	if self.RoundAlive.Fighters[player] then
+		self.RoundAlive.Fighters[player] = nil
+	end
 
-    local roleKey = role == "Boss" and "Bosses" or "Fighters"
-    self.RoundPlayers.Alive[roleKey][player] = true
-
-    local bucket = self.RoundConnections.Players[player]
-    if not bucket then
-        bucket = {}
-        self.RoundConnections.Players[player] = bucket
-    end
-
-    if bucket.HealthChanged then
-        bucket.HealthChanged:Disconnect()
-        bucket.HealthChanged = nil
-    end
-
-    if bucket.MaxHealthChanged then
-        bucket.MaxHealthChanged:Disconnect()
-        bucket.MaxHealthChanged = nil
-    end
-
-    if bucket.HumanoidDied then
-        bucket.HumanoidDied:Disconnect()
-        bucket.HumanoidDied = nil
-    end
-
-    if bucket.HumanoidAdded then
-        bucket.HumanoidAdded:Disconnect()
-        bucket.HumanoidAdded = nil
-    end
-
-    local function attachBossVitalsListeners(humanoid: Humanoid)
-        if role ~= "Boss" then
-            return
-        end
-
-        if bucket.HealthChanged then
-            bucket.HealthChanged:Disconnect()
-            bucket.HealthChanged = nil
-        end
-
-        if bucket.MaxHealthChanged then
-            bucket.MaxHealthChanged:Disconnect()
-            bucket.MaxHealthChanged = nil
-        end
-
-        bucket.HealthChanged = humanoid.HealthChanged:Connect(function()
-            self:_broadcastBossVitals(true)
-        end)
-
-        bucket.MaxHealthChanged = humanoid:GetPropertyChangedSignal("MaxHealth"):Connect(function()
-            self:_broadcastBossVitals(true)
-        end)
-    end
-
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if humanoid then
-        bucket.HumanoidDied = humanoid.Died:Connect(function()
-            self:_onParticipantDied(player, role)
-        end)
-        attachBossVitalsListeners(humanoid)
-    else
-        bucket.HumanoidAdded = character.ChildAdded:Connect(function(child)
-            if child:IsA("Humanoid") then
-                if bucket.HumanoidAdded then
-                    bucket.HumanoidAdded:Disconnect()
-                    bucket.HumanoidAdded = nil
-                end
-                bucket.HumanoidDied = child.Died:Connect(function()
-                    self:_onParticipantDied(player, role)
-                end)
-                attachBossVitalsListeners(child)
-            end
-        end)
-    end
-
-    if role == "Boss" then
-        self:_broadcastBossVitals(true)
-    end
+	self:_checkRoundWinConditions()
 end
 
-function GameManager:_registerRoundParticipant(player: Player, role: string)
-    self:_disconnectPlayerConnections(player)
+function GameManager:_handleRoundTimeout()
+	if self.State ~= "Round" then
+		return
+	end
 
-    local bucket = {}
-    self.RoundConnections.Players[player] = bucket
+	local bossAlive = next(self.RoundAlive.Bosses) ~= nil
+	local fighterAlive = next(self.RoundAlive.Fighters) ~= nil
 
-    local roleKey = role == "Boss" and "Bosses" or "Fighters"
-    self.RoundPlayers.Alive[roleKey][player] = true
-    self.RoundPlayers.Eliminated[player] = false
-
-    bucket.CharacterAdded = player.CharacterAdded:Connect(function(character)
-        self:_handleCharacterSpawn(player, role, character)
-    end)
-
-    if player.Character then
-        self:_handleCharacterSpawn(player, role, player.Character)
-    end
+	if bossAlive and not fighterAlive then
+		self:_endRound("BossVictory")
+	elseif fighterAlive and not bossAlive then
+		self:_endRound("FighterVictory")
+	elseif bossAlive then
+		self:_endRound("RoundTimerExpiredBossAlive")
+	else
+		self:_endRound("RoundTimerExpired")
+	end
 end
 
-function GameManager:_evaluateEliminationOutcome()
-    if not self.RoundPlayers.Alive then
-        return
-    end
-
-    local bossesAlive = countDictionaryKeys(self.RoundPlayers.Alive.Bosses or {})
-    local fightersAlive = countDictionaryKeys(self.RoundPlayers.Alive.Fighters or {})
-
-    if bossesAlive == 0 then
-        self:_log("All bosses have been defeated - fighters win")
-        self:EndRound("FighterVictory")
-    elseif fightersAlive == 0 then
-        self:_log("All fighters have been defeated - bosses win")
-        self:EndRound("BossVictory")
-    end
+function GameManager:_checkRoundWinConditions()
+	if next(self.RoundAlive.Bosses) == nil and next(self.RoundAlive.Fighters) == nil then
+		self:_endRound("EveryoneEliminated")
+	elseif next(self.RoundAlive.Bosses) == nil then
+		self:_endRound("FighterVictory")
+	elseif next(self.RoundAlive.Fighters) == nil then
+		self:_endRound("BossVictory")
+	end
 end
 
-function GameManager:_onParticipantDied(player: Player, role: string)
-    if self.State ~= "Round" then
-        return
-    end
+function GameManager:_getAssignedCharacterInfo(player: Player)
+	local assignment = self.Assignments[player]
+	if not assignment or not assignment.character then
+		return nil, assignment
+	end
 
-    if not self.RoundPlayers.Alive or not self.RoundPlayers.Eliminated then
-        return
-    end
+	local roster = getRosterForRole(assignment.role)
+	if not roster then
+		return nil, assignment
+	end
 
-    if self.RoundPlayers.Eliminated[player] then
-        return
-    end
-
-    local roleKey = role == "Boss" and "Bosses" or "Fighters"
-    if self.RoundPlayers.Alive[roleKey] then
-        self.RoundPlayers.Alive[roleKey][player] = nil
-    end
-
-    self.RoundPlayers.Eliminated[player] = true
-    self:_log(string.format("%s %s has been eliminated", role, player.Name))
-
-    self:_disconnectPlayerConnections(player)
-    self:_evaluateEliminationOutcome()
-
-    if role == "Boss" then
-        self:_broadcastBossVitals(true)
-    end
+	local info = findRosterEntry(roster, assignment.character)
+	return info, assignment
 end
 
-function GameManager:_buildCharacterAssignments()
-    local assignments = {
-        Survivors = {},
-        Bosses = {},
-    }
-
-    for characterName, player in pairs(self.ReservedCharacters.Survivors) do
-        assignments.Survivors[characterName] = player and player.Name or ""
-    end
-
-    for characterName, player in pairs(self.ReservedCharacters.Bosses) do
-        assignments.Bosses[characterName] = player and player.Name or ""
-    end
-
-    return assignments
+function GameManager:_getRoundSkinTemplate(characterName: string): Instance?
+	local folder = findTestModelFolder()
+	if not folder then
+		return nil
+	end
+	return folder:FindFirstChild(characterName)
 end
 
-function GameManager:_broadcastCharacterSelectState(force: boolean?)
-    self:_broadcastTimedState(
-        "CharacterSelect",
-        self.CharacterSelectTimeLeft,
-        {
-            assignments = self:_buildCharacterAssignments(),
-            roster = {
-                Survivors = GameManager.SurvivorCharacters,
-                Bosses = GameManager.BossCharacters,
-            },
-        },
-        force
-    )
-    self:_reportTime("CharacterSelect", self.CharacterSelectTimeLeft)
+function GameManager:_hideCharacterParts(character: Model, hide: boolean)
+	for _, descendant in ipairs(character:GetDescendants()) do
+		if descendant:GetAttribute("RoundSkinPart") then
+			continue
+		end
+
+		if descendant:IsA("BasePart") then
+			if hide then
+				if descendant:GetAttribute("RoundHidden") == nil then
+					descendant:SetAttribute("OriginalTransparency", descendant.Transparency)
+					descendant:SetAttribute("OriginalCanCollide", descendant.CanCollide)
+				end
+				descendant.Transparency = 1
+				descendant.CanCollide = false
+				descendant:SetAttribute("RoundHidden", true)
+			elseif descendant:GetAttribute("RoundHidden") then
+				local originalTransparency = descendant:GetAttribute("OriginalTransparency")
+				if originalTransparency ~= nil then
+					descendant.Transparency = originalTransparency
+				else
+					descendant.Transparency = 0
+				end
+
+				local originalCollide = descendant:GetAttribute("OriginalCanCollide")
+				if originalCollide ~= nil then
+					descendant.CanCollide = originalCollide
+				end
+
+				descendant:SetAttribute("RoundHidden", nil)
+				descendant:SetAttribute("OriginalTransparency", nil)
+				descendant:SetAttribute("OriginalCanCollide", nil)
+			end
+		elseif descendant:IsA("Decal") then
+			if hide then
+				if descendant:GetAttribute("RoundHidden") == nil then
+					descendant:SetAttribute("OriginalTransparency", descendant.Transparency)
+				end
+				descendant.Transparency = 1
+				descendant:SetAttribute("RoundHidden", true)
+			elseif descendant:GetAttribute("RoundHidden") then
+				local original = descendant:GetAttribute("OriginalTransparency")
+				if original ~= nil then
+					descendant.Transparency = original
+				else
+					descendant.Transparency = 0
+				end
+				descendant:SetAttribute("RoundHidden", nil)
+				descendant:SetAttribute("OriginalTransparency", nil)
+			end
+		elseif descendant:IsA("ParticleEmitter") or descendant:IsA("Trail") then
+			if hide then
+				if descendant:GetAttribute("RoundHidden") == nil then
+					descendant:SetAttribute("OriginalEnabled", descendant.Enabled)
+				end
+				descendant.Enabled = false
+				descendant:SetAttribute("RoundHidden", true)
+			elseif descendant:GetAttribute("RoundHidden") then
+				local originalEnabled = descendant:GetAttribute("OriginalEnabled")
+				if originalEnabled ~= nil then
+					descendant.Enabled = originalEnabled
+				else
+					descendant.Enabled = true
+				end
+				descendant:SetAttribute("RoundHidden", nil)
+				descendant:SetAttribute("OriginalEnabled", nil)
+			end
+		end
+	end
 end
 
-function GameManager:UpdateCharacterSelection(deltaTime: number)
-    if self.CharacterSelectTimeLeft <= 0 then
-        self:_log("Character selection timer expired - auto assigning remaining players")
-        self:_autoAssignMissingCharacters()
-        self:_transitionToSelectionLock()
-        return
-    end
-
-    self.CharacterSelectTimeLeft -= deltaTime
-    self:_broadcastCharacterSelectState()
+function GameManager:_clearRoundSkin(character: Model)
+	for _, child in ipairs(character:GetChildren()) do
+		if child:GetAttribute("RoundSkinModel") then
+			child:Destroy()
+		end
+	end
 end
 
-function GameManager:_transitionToSelectionLock()
-    if self.State ~= "CharacterSelect" then
-        return
-    end
-
-    self.State = "SelectionLock"
-    self.SelectionLockTimeLeft = GameManager.SelectionLockLength
-    self.CharacterSelectTimeLeft = 0
-
-    self:_log("All characters locked - preparing to start the round")
-    self._lastBroadcastTimes["SelectionLock_broadcast"] = nil
-    self._lastPrintedTimes["SelectionLock_time"] = nil
-
-    self:_broadcastTimedState(
-        "SelectionLock",
-        self.SelectionLockTimeLeft,
-        {
-            assignments = self:_buildCharacterAssignments(),
-            roster = {
-                Survivors = GameManager.SurvivorCharacters,
-                Bosses = GameManager.BossCharacters,
-            },
-        },
-        true
-    )
+function GameManager:_restoreCharacterAppearance(character: Model)
+	if not character then
+		return
+	end
+	self:_clearRoundSkin(character)
+	self:_hideCharacterParts(character, false)
 end
 
-function GameManager:UpdateSelectionLock(deltaTime: number)
-    if self.SelectionLockTimeLeft <= 0 then
-        self:BeginRound()
-        return
-    end
+function GameManager:_applyRoundAppearance(player: Player, character: Model)
+	if self.State ~= "Round" then
+		return
+	end
 
-    self.SelectionLockTimeLeft -= deltaTime
-    self:_reportTime("SelectionLock", self.SelectionLockTimeLeft)
-    self:_broadcastTimedState(
-        "SelectionLock",
-        self.SelectionLockTimeLeft,
-        {
-            assignments = self:_buildCharacterAssignments(),
-            roster = {
-                Survivors = GameManager.SurvivorCharacters,
-                Bosses = GameManager.BossCharacters,
-            },
-        }
-    )
+	local info = self:_getAssignedCharacterInfo(player)
+	if not info then
+		return
+	end
+
+	local rootPart = character:FindFirstChild("HumanoidRootPart")
+	if not rootPart or not rootPart:IsA("BasePart") then
+		return
+	end
+
+	self:_restoreCharacterAppearance(character)
+
+	local template = self:_getRoundSkinTemplate(info.name)
+	if not template then
+		warn(string.format("[GameManager] Missing round skin template for %s", info.name))
+		return
+	end
+
+	self:_hideCharacterParts(character, true)
+
+	local skin = template:Clone()
+	local hasBasePart = false
+	if skin:IsA("BasePart") then
+		hasBasePart = true
+	elseif skin:IsA("Model") then
+		hasBasePart = skin:FindFirstChildWhichIsA("BasePart", true) ~= nil
+	else
+		hasBasePart = skin:FindFirstChildWhichIsA("BasePart", true) ~= nil
+	end
+
+	if not hasBasePart then
+		skin:Destroy()
+		warn(string.format("[GameManager] Round skin template for %s has no parts to display", info.name))
+		self:_hideCharacterParts(character, false)
+		return
+	end
+
+	skin.Name = "RoundSkinModel"
+	skin:SetAttribute("RoundSkinModel", true)
+	markRoundSkin(skin)
+	skin.Parent = character
+
+	local function weldToRoot(part: BasePart)
+		local weld = Instance.new("WeldConstraint")
+		weld.Part0 = part
+		weld.Part1 = rootPart
+		weld.Parent = part
+	end
+
+	if skin:IsA("Model") then
+		if not skin.PrimaryPart then
+			local primary = skin:FindFirstChildWhichIsA("BasePart", true)
+			if primary then
+				skin.PrimaryPart = primary
+			end
+		end
+
+		if skin.PrimaryPart then
+			skin:PivotTo(rootPart.CFrame)
+		end
+
+		for _, descendant in ipairs(skin:GetDescendants()) do
+			if descendant:IsA("BasePart") then
+				weldToRoot(descendant)
+			end
+		end
+	elseif skin:IsA("BasePart") then
+		skin.CFrame = rootPart.CFrame
+		weldToRoot(skin)
+	else
+		-- Non-model, non-part templates are simply parented without welding.
+	end
 end
 
--- Round --------------------------------------------------------------------
+function GameManager:_applyRoundAppearances()
+	for _, player in ipairs(self.RoundParticipants.Bosses or {}) do
+		local character = player.Character
+		if character then
+			self:_applyRoundAppearance(player, character)
+		end
+	end
 
-function GameManager:BeginRound()
-    local fighterCount = #self.RoundPlayers.Fighters
-    local bossCount = #self.RoundPlayers.Bosses
-
-    if bossCount == 0 then
-        self:_log("Cannot begin round - no bosses were selected")
-        self:EndRound("NoBosses")
-        return
-    elseif fighterCount == 0 then
-        self:_log("Cannot begin round - no fighters were selected")
-        self:EndRound("NoFighters")
-        return
-    end
-
-    local roundLength = GameManager.BaseRoundLength + (fighterCount * GameManager.RoundIncrementPerFighter)
-
-    self.ActiveRoundLength = roundLength
-    self.RoundCountdown = roundLength
-    self.State = "Round"
-    self.CharacterSelectTimeLeft = 0
-    self.SelectionLockTimeLeft = 0
-    self.RoundPlayers.LeftCount = 0
-    self.RoundPlayers.Alive = {
-        Bosses = {},
-        Fighters = {},
-    }
-    self.RoundPlayers.Eliminated = {}
-
-    self:_cleanupRoundConnections()
-
-    for _, boss in ipairs(self.RoundPlayers.Bosses) do
-        self:_registerRoundParticipant(boss, "Boss")
-    end
-
-    for _, fighter in ipairs(self.RoundPlayers.Fighters) do
-        self:_registerRoundParticipant(fighter, "Fighter")
-    end
-
-    self:_log(string.format("Round started with %d fighters and %d boss(es)", fighterCount, bossCount))
-    self._lastBroadcastTimes["Round_broadcast"] = nil
-    self._lastPrintedTimes["Round_time"] = nil
-    self:_broadcastTimedState(
-        "Round",
-        self.RoundCountdown,
-        self:_buildRoundPayload()
-    )
+	for _, player in ipairs(self.RoundParticipants.Fighters or {}) do
+		local character = player.Character
+		if character then
+			self:_applyRoundAppearance(player, character)
+		end
+	end
 end
 
-function GameManager:UpdateRound(deltaTime: number)
-    if self.RoundCountdown <= 0 then
-        self:_resolveRoundTimeoutOutcome()
-        return
-    end
-
-    self.RoundCountdown -= deltaTime
-    self:_reportTime("Round", self.RoundCountdown)
-    self:_broadcastTimedState(
-        "Round",
-        self.RoundCountdown,
-        self:_buildRoundPayload()
-    )
+function GameManager:_restoreAllAppearances()
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		if character then
+			self:_restoreCharacterAppearance(character)
+		end
+	end
 end
 
-function GameManager:_resolveRoundTimeoutOutcome()
-    if not self.RoundPlayers or not self.RoundPlayers.Alive then
-        self:_log("Round timer expired - unable to determine participants")
-        self:EndRound("TimeUp")
-        return
-    end
+function GameManager:_applyCharacterStats(player: Player, humanoid: Humanoid)
+	local info, assignment = self:_getAssignedCharacterInfo(player)
+	if not info or not info.stats then
+		return
+	end
 
-    local bossesAlive = countDictionaryKeys(self.RoundPlayers.Alive.Bosses or {})
-    local fightersAlive = countDictionaryKeys(self.RoundPlayers.Alive.Fighters or {})
+	local stats = info.stats
 
-    if bossesAlive > 0 and fightersAlive > 0 then
-        self:_log("Round timer expired with bosses alive - bosses win")
-        self:EndRound("BossVictory")
-    elseif bossesAlive == 0 and fightersAlive > 0 then
-        self:_log("Round timer expired but no bosses remain - fighters win")
-        self:EndRound("FighterVictory")
-    elseif bossesAlive > 0 and fightersAlive == 0 then
-        self:_log("Round timer expired with no fighters remaining - bosses win")
-        self:EndRound("BossVictory")
-    else
-        self:_log("Round timer expired with no participants remaining")
-        self:EndRound("TimeUp")
-    end
+	local maxHealth = tonumber(stats.hp)
+	if maxHealth and maxHealth > 0 then
+		maxHealth = math.max(1, math.floor(maxHealth + 0.5))
+		humanoid.MaxHealth = maxHealth
+		humanoid.Health = maxHealth
+		humanoid:SetAttribute("MaxHealthBase", maxHealth)
+	end
+
+	local walkSpeed = tonumber(stats.speed)
+	if walkSpeed and walkSpeed > 0 then
+		humanoid.WalkSpeed = walkSpeed
+		humanoid:SetAttribute("Speed", walkSpeed)
+	end
+
+	local jumpValue = tonumber(stats.jump)
+	if jumpValue and jumpValue > 0 then
+		if humanoid.UseJumpPower == nil or humanoid.UseJumpPower then
+			humanoid.JumpPower = jumpValue
+		else
+			humanoid.JumpHeight = jumpValue
+		end
+		humanoid:SetAttribute("Jump", jumpValue)
+	end
+
+	local attack = tonumber(stats.attack)
+	if attack then
+		humanoid:SetAttribute("Attack", attack)
+	end
+
+	if assignment then
+		humanoid:SetAttribute("AssignedRole", assignment.role)
+		humanoid:SetAttribute("AssignedCharacter", assignment.character)
+	end
 end
 
-function GameManager:EndRound(reason: string)
-    self.State = "Waiting"
-    self.RoundCountdown = 0
-    self.ActiveRoundLength = 0
-    self.SelectionLockTimeLeft = 0
-    self.CharacterSelectTimeLeft = 0
+function GameManager:_trackParticipant(player: Player)
+	local function hookCharacter(character: Model)
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			self:_applyCharacterStats(player, humanoid)
+			humanoid.Died:Connect(function()
+				self:_markParticipantDown(player)
+			end)
+		else
+			local connection: RBXScriptConnection?
+			connection = character.ChildAdded:Connect(function(child)
+				if child:IsA("Humanoid") then
+					if connection then
+						connection:Disconnect()
+						connection = nil
+					end
+					self:_applyCharacterStats(player, child)
+					child.Died:Connect(function()
+						self:_markParticipantDown(player)
+					end)
+				end
+			end)
+		end
 
-    self:_cleanupRoundConnections()
+		if self.State == "Round" then
+			self:_applyRoundAppearance(player, character)
+		else
+			self:_restoreCharacterAppearance(character)
+		end
+	end
 
-    self.ReservedCharacters = {
-        Survivors = {},
-        Bosses = {},
-    }
-    self.RoundPlayers = {
-        Bosses = {},
-        Fighters = {},
-        RoleLookup = {},
-        LeftCount = 0,
-    }
+	local character = player.Character
+	if character then
+		hookCharacter(character)
+	end
 
-    self.RoundPlayers.Alive = nil
-    self.RoundPlayers.Eliminated = nil
+	local connections = self.RoundConnections.Players
+	if connections[player] then
+		connections[player]:Disconnect()
+	end
 
-    self:_log(string.format("Round ended because: %s", reason))
-    self:_broadcastState("RoundEnd", {
-        reason = reason,
-        winner = roundWinners[reason],
-    })
+	connections[player] = player.CharacterAdded:Connect(function(newCharacter)
+		hookCharacter(newCharacter)
+	end)
 end
 
--- Player departure rules ---------------------------------------------------
+function GameManager:_endRound(reason: string)
+	if self.State ~= "Round" and reason ~= "NoOpponents" then
+		return
+	end
 
-function GameManager:OnPlayerLeft(player: Player)
-    self.BossChances[player] = nil
+	self.RoundEndReason = reason
 
-    if self.State == "CharacterSelect" then
-        self:_clearPlayerReservation(player)
-        self:_removeFromRound(player)
-        self:CheckCharacterSelectionCompletion()
-        self:_broadcastCharacterSelectState(true)
-        return
-    end
+	local bossAlive = next(self.RoundAlive.Bosses) ~= nil
+	local fighterAlive = next(self.RoundAlive.Fighters) ~= nil
 
-    if self.State ~= "Round" then
-        return
-    end
+	if reason == "FighterVictory" or (not bossAlive and fighterAlive) then
+		self.RoundWinner = ROLE_FIGHTER
+	elseif reason == "BossVictory" or (bossAlive and not fighterAlive) or reason == "RoundTimerExpiredBossAlive" then
+		self.RoundWinner = ROLE_BOSS
+	else
+		self.RoundWinner = nil
+	end
 
-    local bossLeaving = table.find(self.RoundPlayers.Bosses, player)
-    local fighterLeaving = table.find(self.RoundPlayers.Fighters, player)
+	local endsAt = getTimeNow() + GameManager.ResultsLength
+	self:_switchState("RoundResults", endsAt)
 
-    if bossLeaving then
-        self:_log(string.format("Boss %s left the game", player.Name))
-        self:_disconnectPlayerConnections(player)
-        self:EndRound("BossLeft")
-        return
-    end
+	for player, conn in pairs(self.RoundConnections.Players) do
+		conn:Disconnect()
+		self.RoundConnections.Players[player] = nil
+	end
+end
 
-    if fighterLeaving then
-        if self.RoundPlayers.Alive and self.RoundPlayers.Alive.Fighters then
-            self.RoundPlayers.Alive.Fighters[player] = nil
-        end
+function GameManager:_checkSelectionProgress()
+	if self.State ~= "CharacterSelect" then
+		return
+	end
 
-        if self.RoundPlayers.Eliminated then
-            self.RoundPlayers.Eliminated[player] = true
-        end
+	local bossesMissing = false
+	local fightersMissing = false
 
-        self:_disconnectPlayerConnections(player)
+	for player, assignment in pairs(self.Assignments) do
+		if assignment.role == ROLE_BOSS and assignment.character == nil then
+			bossesMissing = true
+		elseif assignment.role == ROLE_FIGHTER and assignment.character == nil then
+			fightersMissing = true
+		end
+	end
 
-        local fightersRemaining = {}
-        for _, survivor in ipairs(self.RoundPlayers.Fighters) do
-            if survivor ~= player and survivor.Parent == Players then
-                table.insert(fightersRemaining, survivor)
-            end
-        end
-        self.RoundPlayers.Fighters = fightersRemaining
-        self:_rebuildRoleLookup()
+	if not bossesMissing and not fightersMissing then
+		self:_lockSelections()
+	end
+end
 
-        if #fightersRemaining == 0 then
-            self:_log("All fighters have left the round")
-            self:EndRound("AllFightersLeft")
-            return
-        end
-    end
+function GameManager:_onCharacterRequested(player: Player, role: string, characterName: string)
+	if self.State ~= "CharacterSelect" then
+		return
+	end
 
-    -- Global rule: if more than two players leave during a round, end it.
-    self.RoundPlayers.LeftCount = (self.RoundPlayers.LeftCount or 0) + 1
-    if self.RoundPlayers.LeftCount > 2 then
-        self:_log("Ending round because too many players left")
-        self:EndRound("TooManyPlayersLeft")
-    end
+	local assignment = self.Assignments[player]
+	if not assignment or assignment.role ~= role then
+		return
+	end
+
+	local roster
+	local reservations
+
+	if role == ROLE_BOSS then
+		roster = BossRoster
+		reservations = self.ReservedCharacters.Bosses
+	else
+		roster = FighterRoster
+		reservations = self.ReservedCharacters.Survivors
+	end
+
+	if not rosterContains(roster, characterName) then
+		return
+	end
+
+	local reservedPlayer = reservations[characterName]
+	if reservedPlayer and reservedPlayer ~= player then
+		return
+	end
+
+	if assignment.character then
+		reservations[assignment.character] = nil
+	end
+
+	assignment.character = characterName
+	reservations[characterName] = player
+
+	self:_broadcastAssignments()
+	self:_checkSelectionProgress()
+end
+
+function GameManager:_broadcastAssignments()
+	local summary = {}
+	for player, assignment in pairs(self.Assignments) do
+		summary[player.UserId] = {
+			name = player.Name,
+			role = assignment.role,
+			character = assignment.character,
+		}
+	end
+	self.Remotes.CharacterAssignment:FireAllClients(summary)
+	self:_broadcastState()
+end
+
+function GameManager:_broadcastState()
+	local payload = self:_buildStatePayload()
+	self._lastPayload = deepCopy(payload)
+	self.Remotes.RoundStateChanged:FireAllClients(payload)
+end
+
+function GameManager:_buildStatePayload()
+	local now = getTimeNow()
+	local payload: {[string]: any} = {
+		step = self.State,
+		stepEndsAt = self.StateEndsAt,
+		now = now,
+		intermissionLength = GameManager.IntermissionLength,
+		characterSelectLength = GameManager.CharacterSelectLength,
+		selectionLockLength = GameManager.SelectionLockLength,
+		roundLength = self.RoundLength,
+		assignments = {},
+	}
+
+	for player, assignment in pairs(self.Assignments) do
+		payload.assignments[player.UserId] = {
+			name = player.Name,
+			role = assignment.role,
+			character = assignment.character,
+		}
+	end
+
+	if self.State == "Intermission" then
+		payload.intermissionEndsAt = self.StateEndsAt
+	elseif self.State == "CharacterSelect" or self.State == "SelectionLock" then
+		local bosses = {}
+		local fighters = {}
+		for player, assignment in pairs(self.Assignments) do
+			if assignment.role == ROLE_BOSS then
+				table.insert(bosses, player.UserId)
+			else
+				table.insert(fighters, player.UserId)
+			end
+		end
+
+		payload.selection = {
+			bosses = bosses,
+			fighters = fighters,
+		}
+
+		payload.roster = {
+			bosses = deepCopy(BossRoster),
+			fighters = deepCopy(FighterRoster),
+		}
+	elseif self.State == "Round" or self.State == "RoundResults" then
+		local bossEntries = {}
+		for _, player in ipairs(self.RoundParticipants.Bosses) do
+			local assignment = self.Assignments[player]
+			table.insert(bossEntries, {
+				userId = player.UserId,
+				name = player.Name,
+				character = assignment and assignment.character or nil,
+				playerName = player.Name,
+				alive = self.RoundAlive.Bosses[player] == true,
+			})
+		end
+
+		local fighterEntries = {}
+		for _, player in ipairs(self.RoundParticipants.Fighters) do
+			local assignment = self.Assignments[player]
+			table.insert(fighterEntries, {
+				userId = player.UserId,
+				name = player.Name,
+				character = assignment and assignment.character or nil,
+				playerName = player.Name,
+				alive = self.RoundAlive.Fighters[player] == true,
+			})
+		end
+
+		payload.round = {
+			bosses = bossEntries,
+			fighters = fighterEntries,
+			roundEndsAt = self.RoundEndsAt,
+			winner = self.RoundWinner,
+			reason = self.RoundEndReason,
+		}
+	end
+
+	return payload
 end
 
 return GameManager
